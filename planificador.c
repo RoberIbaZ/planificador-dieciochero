@@ -1,6 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
 
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +19,9 @@ typedef struct {
     int tiempo;        /* en milisegundos */
     int num_deps;
     char **deps;       /* IDs de las dependencias, tal como vienen en el archivo */
+    int *hijos;        /* posiciones de las actividades que dependen de esta */
+    int num_hijos;
+    int pendientes;    /* dependencias que aún no terminan */
 } Actividad;
 
 Actividad *actividades = NULL;
@@ -152,12 +154,95 @@ int leer_plan(const char *ruta) {
     return 0;
 }
 
+void agregar_hijo(Actividad *a, int hijo) {
+    a->hijos = realloc(a->hijos, (a->num_hijos + 1) * sizeof(int));
+    if (a->hijos == NULL) {
+        perror("realloc");
+        exit(1);
+    }
+    a->hijos[a->num_hijos] = hijo;
+    a->num_hijos++;
+}
+
+/* Convierte los IDs de las dependencias en aristas del grafo:
+   si i depende de d, entonces i es hijo de d y d le suma 1 a los pendientes de i. */
+int armar_grafo(void) {
+    for (int i = 0; i < num_actividades; i++) {
+        Actividad *a = &actividades[i];
+        for (int j = 0; j < a->num_deps; j++) {
+            int d = buscar_actividad(a->deps[j]);
+            if (d == -1) {
+                fprintf(stderr, "Actividad '%s' depende de '%s', que no existe\n", a->id, a->deps[j]);
+                return -1;
+            }
+            if (d == i) {
+                fprintf(stderr, "Actividad '%s' depende de si misma\n", a->id);
+                return -1;
+            }
+
+            /* Si la dependencia viene repetida (ej: "1, 1") se cuenta una sola vez */
+            int repetida = 0;
+            for (int h = 0; h < actividades[d].num_hijos; h++) {
+                if (actividades[d].hijos[h] == i) repetida = 1;
+            }
+            if (repetida) continue;
+
+            agregar_hijo(&actividades[d], i);
+            a->pendientes++;
+        }
+    }
+    return 0;
+}
+
+/* Revisa que el grafo no tenga ciclos (algoritmo de Kahn).
+   Se van "sacando" las actividades sin pendientes; si al final quedan
+   actividades sin sacar, es porque forman un ciclo. */
+int revisar_ciclos(void) {
+    int *pendientes = malloc(num_actividades * sizeof(int));
+    int *cola = malloc(num_actividades * sizeof(int));
+    if (num_actividades > 0 && (pendientes == NULL || cola == NULL)) {
+        perror("malloc");
+        exit(1);
+    }
+
+    int inicio = 0, fin = 0;
+    for (int i = 0; i < num_actividades; i++) {
+        pendientes[i] = actividades[i].pendientes;
+        if (pendientes[i] == 0) cola[fin++] = i;
+    }
+
+    while (inicio < fin) {
+        int actual = cola[inicio++];
+        for (int h = 0; h < actividades[actual].num_hijos; h++) {
+            int hijo = actividades[actual].hijos[h];
+            pendientes[hijo]--;
+            if (pendientes[hijo] == 0) cola[fin++] = hijo;
+        }
+    }
+
+    int resultado = 0;
+    if (fin < num_actividades) {
+        fprintf(stderr, "El plan tiene un ciclo entre las actividades:");
+        for (int i = 0; i < num_actividades; i++) {
+            if (pendientes[i] > 0) fprintf(stderr, " %s", actividades[i].id);
+        }
+        fprintf(stderr, "\n");
+        resultado = -1;
+    }
+
+    free(pendientes);
+    free(cola);
+    return resultado;
+}
+
 void mostrar_plan(void) {
     printf("Plan con %d actividades:\n", num_actividades);
     for (int i = 0; i < num_actividades; i++) {
         Actividad *a = &actividades[i];
         printf("  [%s] %s (%d ms) deps:", a->id, a->nombre, a->tiempo);
         for (int j = 0; j < a->num_deps; j++) printf(" %s", a->deps[j]);
+        printf(" | desbloquea:");
+        for (int h = 0; h < a->num_hijos; h++) printf(" %s", actividades[a->hijos[h]].id);
         printf("\n");
     }
 }
@@ -166,6 +251,7 @@ void liberar_plan(void) {
     for (int i = 0; i < num_actividades; i++) {
         for (int j = 0; j < actividades[i].num_deps; j++) free(actividades[i].deps[j]);
         free(actividades[i].deps);
+        free(actividades[i].hijos);
     }
     free(actividades);
 }
@@ -185,7 +271,7 @@ int main(int argc, char *argv[]) {
 
     srand(time(NULL) ^ getpid());
 
-    if (leer_plan(argv[1]) != 0) {
+    if (leer_plan(argv[1]) != 0 || armar_grafo() != 0 || revisar_ciclos() != 0) {
         liberar_plan();
         return 1;
     }
