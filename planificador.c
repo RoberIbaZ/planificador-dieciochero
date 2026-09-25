@@ -6,6 +6,9 @@
 #include <ctype.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #define MAX_LINEA 8192
 #define MAX_ID 64
@@ -22,11 +25,14 @@ typedef struct {
     int *hijos;        /* posiciones de las actividades que dependen de esta */
     int num_hijos;
     int pendientes;    /* dependencias que aún no terminan */
+    pid_t pid;         /* pid del proceso que la simula (0 si no ha partido) */
 } Actividad;
 
 Actividad *actividades = NULL;
 int num_actividades = 0;
 int capacidad = 0;
+
+struct timespec inicio_simulacion;
 
 /* Quita espacios al inicio y al final. Modifica el string. */
 char *recortar(char *s) {
@@ -235,16 +241,106 @@ int revisar_ciclos(void) {
     return resultado;
 }
 
-void mostrar_plan(void) {
-    printf("Plan con %d actividades:\n", num_actividades);
-    for (int i = 0; i < num_actividades; i++) {
-        Actividad *a = &actividades[i];
-        printf("  [%s] %s (%d ms) deps:", a->id, a->nombre, a->tiempo);
-        for (int j = 0; j < a->num_deps; j++) printf(" %s", a->deps[j]);
-        printf(" | desbloquea:");
-        for (int h = 0; h < a->num_hijos; h++) printf(" %s", actividades[a->hijos[h]].id);
-        printf("\n");
+/* Milisegundos transcurridos desde que partió la simulación. */
+long tiempo_actual(void) {
+    struct timespec ahora;
+    clock_gettime(CLOCK_MONOTONIC, &ahora);
+    return (ahora.tv_sec - inicio_simulacion.tv_sec) * 1000
+         + (ahora.tv_nsec - inicio_simulacion.tv_nsec) / 1000000;
+}
+
+/* Código que ejecuta el proceso hijo: duerme el tiempo de la actividad y termina. */
+void simular_actividad(Actividad *a) {
+    struct timespec espera;
+    espera.tv_sec = a->tiempo / 1000;
+    espera.tv_nsec = (long)(a->tiempo % 1000) * 1000000;
+    while (nanosleep(&espera, &espera) == -1 && errno == EINTR) {
+        /* si una señal interrumpe el sueño, se sigue durmiendo lo que falta */
     }
+    _exit(0);
+}
+
+/* Crea el proceso de la actividad i. Devuelve 0 si se pudo, -1 si fork falló. */
+int lanzar_actividad(int i) {
+    Actividad *a = &actividades[i];
+    fflush(stdout);  /* para que el hijo no herede texto sin imprimir */
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        return -1;
+    }
+    if (pid == 0) {
+        simular_actividad(a);
+    }
+    a->pid = pid;
+    printf("[%6ld ms] inicia  %s (%s, %d ms, pid %d)\n",
+           tiempo_actual(), a->id, a->nombre, a->tiempo, (int)pid);
+    return 0;
+}
+
+int buscar_por_pid(pid_t pid) {
+    for (int i = 0; i < num_actividades; i++) {
+        if (actividades[i].pid == pid) return i;
+    }
+    return -1;
+}
+
+/* Ejecuta el plan: lanza las actividades listas y espera a que terminen.
+   Cuando una termina, se descuenta de los pendientes de sus hijos y los
+   que quedan en 0 pasan a la cola de listas. */
+void ejecutar_plan(void) {
+    int *cola = malloc(num_actividades * sizeof(int));
+    if (num_actividades > 0 && cola == NULL) {
+        perror("malloc");
+        exit(1);
+    }
+    int inicio = 0, fin = 0;
+    for (int i = 0; i < num_actividades; i++) {
+        if (actividades[i].pendientes == 0) cola[fin++] = i;
+    }
+
+    int corriendo = 0;
+    int terminadas = 0;
+    clock_gettime(CLOCK_MONOTONIC, &inicio_simulacion);
+
+    while (terminadas < num_actividades) {
+        while (inicio < fin) {
+            if (lanzar_actividad(cola[inicio]) != 0) break;
+            inicio++;
+            corriendo++;
+        }
+
+        if (corriendo == 0) {
+            fprintf(stderr, "No se pudo crear ningun proceso, se detiene la simulacion\n");
+            break;
+        }
+
+        /* waitpid bloquea al padre hasta que termine algún hijo (sin busy-waiting) */
+        int estado;
+        pid_t pid = waitpid(-1, &estado, 0);
+        if (pid == -1) {
+            if (errno == EINTR) continue;
+            perror("waitpid");
+            break;
+        }
+
+        int i = buscar_por_pid(pid);
+        if (i == -1) continue;
+        corriendo--;
+        terminadas++;
+        Actividad *a = &actividades[i];
+        printf("[%6ld ms] termina %s (%s)\n", tiempo_actual(), a->id, a->nombre);
+
+        for (int h = 0; h < a->num_hijos; h++) {
+            int hijo = a->hijos[h];
+            actividades[hijo].pendientes--;
+            if (actividades[hijo].pendientes == 0) cola[fin++] = hijo;
+        }
+    }
+
+    printf("Simulacion terminada: %d de %d actividades completadas en %ld ms\n",
+           terminadas, num_actividades, tiempo_actual());
+    free(cola);
 }
 
 void liberar_plan(void) {
@@ -276,7 +372,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    mostrar_plan();
+    printf("Plan cargado: %d actividades, K = %ld\n", num_actividades, k);
+    ejecutar_plan();
     liberar_plan();
     return 0;
 }
