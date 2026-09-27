@@ -27,6 +27,7 @@ typedef struct {
     int pendientes;    /* dependencias que aún no terminan */
     pid_t pid;         /* pid del proceso que la simula (0 si no ha partido) */
     int pipe_fd[2];    /* tubería para recibir el insumo de la actividad */
+    int estado_final;  /* 0 = pendiente, 1 = completada, 2 = fallida, 3 = abortada */
 } Actividad;
 
 Actividad *actividades = NULL;
@@ -302,9 +303,20 @@ int buscar_por_pid(pid_t pid) {
     return -1;
 }
 
-/* Ejecuta el plan: lanza las actividades listas y espera a que terminen.
-   Cuando una termina, se descuenta de los pendientes de sus hijos y los
-   que quedan en 0 pasan a la cola de listas. */
+void abortar_rama(int i, int *terminadas_count) {
+    Actividad *a = &actividades[i];
+    for (int h = 0; h < a->num_hijos; h++) {
+        int hijo = a->hijos[h];
+        if (actividades[hijo].estado_final == 0) {
+            actividades[hijo].estado_final = 3;
+            (*terminadas_count)++;
+            printf("[%6ld ms] [ABORTADA] Actividad %s cancelada por dependencia insatisfecha\n",
+                   tiempo_actual(), actividades[hijo].id);
+            abortar_rama(hijo, terminadas_count);
+        }
+    }
+}
+
 void ejecutar_plan(int k) {
     int *cola = malloc(num_actividades * sizeof(int));
     if (num_actividades > 0 && cola == NULL) {
@@ -356,12 +368,22 @@ void ejecutar_plan(int k) {
         }
         close(a->pipe_fd[0]);
 
-        printf("[%6ld ms] termina %s (%s)\n", tiempo_actual(), a->id, a->nombre);
+        if (WIFEXITED(estado) && WEXITSTATUS(estado) == 0) {
+            a->estado_final = 1;
+            printf("[%6ld ms] termina %s (%s)\n", tiempo_actual(), a->id, a->nombre);
 
-        for (int h = 0; h < a->num_hijos; h++) {
-            int hijo = a->hijos[h];
-            actividades[hijo].pendientes--;
-            if (actividades[hijo].pendientes == 0) cola[fin++] = hijo;
+            for (int h = 0; h < a->num_hijos; h++) {
+                int hijo = a->hijos[h];
+                if (actividades[hijo].estado_final == 0) {
+                    actividades[hijo].pendientes--;
+                    if (actividades[hijo].pendientes == 0) cola[fin++] = hijo;
+                }
+            }
+        } else {
+            a->estado_final = 2;
+            fprintf(stderr, "[%6ld ms] [FALLO] Actividad %s finalizo de forma anormal\n",
+                    tiempo_actual(), a->id);
+            abortar_rama(i, &terminadas);
         }
     }
 
