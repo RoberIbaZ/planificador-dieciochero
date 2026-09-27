@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 #define MAX_LINEA 8192
 #define MAX_ID 64
@@ -35,8 +36,13 @@ int num_actividades = 0;
 int capacidad = 0;
 
 struct timespec inicio_simulacion;
+static volatile sig_atomic_t g_seremi = 0;
 
-/* Quita espacios al inicio y al final. Modifica el string. */
+void manejador_sigint(int sig) {
+    (void)sig;
+    g_seremi = 1;
+}
+
 char *recortar(char *s) {
     while (isspace((unsigned char)*s)) s++;
     char *fin = s + strlen(s);
@@ -262,7 +268,7 @@ void simular_actividad(Actividad *a) {
     while (nanosleep(&espera, &espera) == -1 && errno == EINTR) {}
 
     /* Escribir mensaje de insumo por la tuberia */
-    char mensaje[128];
+    char mensaje[256];
     snprintf(mensaje, sizeof(mensaje), "Insumo de '%s' listo", a->nombre);
     write(a->pipe_fd[1], mensaje, strlen(mensaje) + 1);
     close(a->pipe_fd[1]);
@@ -333,6 +339,21 @@ void ejecutar_plan(int k) {
     clock_gettime(CLOCK_MONOTONIC, &inicio_simulacion);
 
     while (terminadas < num_actividades) {
+        /* Fiscalización de la Seremi */
+        if (g_seremi) {
+            printf("\n[%6ld ms] [SEREMI] ¡Fiscalizacion! Abortando actividades en ejecucion...\n",
+                   tiempo_actual());
+            for (int i = 0; i < num_actividades; i++) {
+                if (actividades[i].pid > 0 && actividades[i].estado_final == 0) {
+                    kill(actividades[i].pid, SIGTERM);
+                }
+            }
+            while (waitpid(-1, NULL, 0) > 0) {}
+            printf("[%6ld ms] [SEREMI] Clausura completada.\n", tiempo_actual());
+            break;
+        }
+
+        /* Lanzar hasta completar límite K */
         while (inicio < fin && corriendo < k) {
             if (lanzar_actividad(cola[inicio]) != 0) break;
             inicio++;
@@ -415,6 +436,13 @@ int main(int argc, char *argv[]) {
     }
 
     srand(time(NULL) ^ getpid());
+
+    /* Configurar manejo de SIGINT */
+    struct sigaction sa;
+    sa.sa_handler = manejador_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
 
     if (leer_plan(argv[1]) != 0 || armar_grafo() != 0 || revisar_ciclos() != 0) {
         liberar_plan();
