@@ -288,7 +288,7 @@ int buscar_por_pid(pid_t pid) {
 /* Ejecuta el plan: lanza las actividades listas y espera a que terminen.
    Cuando una termina, se descuenta de los pendientes de sus hijos y los
    que quedan en 0 pasan a la cola de listas. */
-void ejecutar_plan(void) {
+void ejecutar_plan(int k) {
     int *cola = malloc(num_actividades * sizeof(int));
     if (num_actividades > 0 && cola == NULL) {
         perror("malloc");
@@ -304,18 +304,19 @@ void ejecutar_plan(void) {
     clock_gettime(CLOCK_MONOTONIC, &inicio_simulacion);
 
     while (terminadas < num_actividades) {
-        while (inicio < fin) {
+        while (inicio < fin && corriendo < k) {
             if (lanzar_actividad(cola[inicio]) != 0) break;
             inicio++;
             corriendo++;
         }
 
         if (corriendo == 0) {
-            fprintf(stderr, "No se pudo crear ningun proceso, se detiene la simulacion\n");
+            if (inicio == fin && terminadas < num_actividades) {
+                fprintf(stderr, "No hay mas actividades listas para ejecutar\n");
+            }
             break;
         }
 
-        /* waitpid bloquea al padre hasta que termine algún hijo (sin busy-waiting) */
         int estado;
         pid_t pid = waitpid(-1, &estado, 0);
         if (pid == -1) {
@@ -373,7 +374,7 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Plan cargado: %d actividades, K = %ld\n", num_actividades, k);
-    ejecutar_plan();
+    ejecutar_plan((int)k);
     liberar_plan();
     return 0;
 }
