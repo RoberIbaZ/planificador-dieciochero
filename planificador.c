@@ -26,6 +26,7 @@ typedef struct {
     int num_hijos;
     int pendientes;    /* dependencias que aún no terminan */
     pid_t pid;         /* pid del proceso que la simula (0 si no ha partido) */
+    int pipe_fd[2];    /* tubería para recibir el insumo de la actividad */
 } Actividad;
 
 Actividad *actividades = NULL;
@@ -251,27 +252,43 @@ long tiempo_actual(void) {
 
 /* Código que ejecuta el proceso hijo: duerme el tiempo de la actividad y termina. */
 void simular_actividad(Actividad *a) {
+    /* Cerrar lectura en el hijo */
+    close(a->pipe_fd[0]);
+
     struct timespec espera;
     espera.tv_sec = a->tiempo / 1000;
     espera.tv_nsec = (long)(a->tiempo % 1000) * 1000000;
-    while (nanosleep(&espera, &espera) == -1 && errno == EINTR) {
-        /* si una señal interrumpe el sueño, se sigue durmiendo lo que falta */
-    }
+    while (nanosleep(&espera, &espera) == -1 && errno == EINTR) {}
+
+    /* Escribir mensaje de insumo por la tuberia */
+    char mensaje[128];
+    snprintf(mensaje, sizeof(mensaje), "Insumo de '%s' listo", a->nombre);
+    write(a->pipe_fd[1], mensaje, strlen(mensaje) + 1);
+    close(a->pipe_fd[1]);
+
     _exit(0);
 }
 
 /* Crea el proceso de la actividad i. Devuelve 0 si se pudo, -1 si fork falló. */
 int lanzar_actividad(int i) {
     Actividad *a = &actividades[i];
-    fflush(stdout);  /* para que el hijo no herede texto sin imprimir */
+    if (pipe(a->pipe_fd) == -1) {
+        perror("pipe");
+        return -1;
+    }
+
+    fflush(stdout);
     pid_t pid = fork();
     if (pid == -1) {
         perror("fork");
+        close(a->pipe_fd[0]);
+        close(a->pipe_fd[1]);
         return -1;
     }
     if (pid == 0) {
         simular_actividad(a);
     }
+    close(a->pipe_fd[1]);
     a->pid = pid;
     printf("[%6ld ms] inicia  %s (%s, %d ms, pid %d)\n",
            tiempo_actual(), a->id, a->nombre, a->tiempo, (int)pid);
@@ -330,6 +347,15 @@ void ejecutar_plan(int k) {
         corriendo--;
         terminadas++;
         Actividad *a = &actividades[i];
+
+        char buffer[128];
+        ssize_t bytes = read(a->pipe_fd[0], buffer, sizeof(buffer) - 1);
+        if (bytes > 0) {
+            buffer[bytes] = '\0';
+            printf("[%6ld ms] pipe recibido de %s: \"%s\"\n", tiempo_actual(), a->id, buffer);
+        }
+        close(a->pipe_fd[0]);
+
         printf("[%6ld ms] termina %s (%s)\n", tiempo_actual(), a->id, a->nombre);
 
         for (int h = 0; h < a->num_hijos; h++) {
