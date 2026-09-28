@@ -54,6 +54,12 @@ void manejador_sigint(int sig) {
     g_seremi = 1;
 }
 
+/* No hace nada: solo existe para que SIGCHLD despierte a sigsuspend
+   cuando termina un hijo (con la acción por defecto la señal se descarta). */
+void manejador_sigchld(int sig) {
+    (void)sig;
+}
+
 /* Quita espacios al inicio y al final. Modifica el string. */
 char *recortar(char *s) {
     while (isspace((unsigned char)*s)) s++;
@@ -286,6 +292,11 @@ void dormir_ms(int ms) {
 void simular_actividad(int i, int entrada) {
     Actividad *a = &actividades[i];
 
+    /* El hijo hereda la máscara del padre con SIGINT y SIGCHLD bloqueadas; se limpia */
+    sigset_t vacia;
+    sigemptyset(&vacia);
+    sigprocmask(SIG_SETMASK, &vacia, NULL);
+
     /* El hijo hereda las tuberías de las otras actividades en curso; no las usa */
     for (int j = 0; j < num_actividades; j++) {
         if (j != i && actividades[j].pid > 0 && actividades[j].estado_final == PENDIENTE) {
@@ -319,30 +330,31 @@ void simular_actividad(int i, int entrada) {
 }
 
 /* Crea el proceso de la actividad i y le envía los insumos de sus dependencias.
-   Devuelve 0 si se pudo, -1 si falló pipe o fork. */
+   Devuelve 0 si se pudo, -1 si falló pipe o fork (el motivo queda en errno). */
 int lanzar_actividad(int i) {
     Actividad *a = &actividades[i];
     int entrada[2];  /* tubería padre -> hijo con los insumos de las dependencias */
 
     if (pipe(a->pipe_salida) == -1) {
-        perror("pipe");
         return -1;
     }
     if (pipe(entrada) == -1) {
-        perror("pipe");
+        int error = errno;
         close(a->pipe_salida[0]);
         close(a->pipe_salida[1]);
+        errno = error;
         return -1;
     }
 
     fflush(stdout);  /* para que el hijo no herede texto sin imprimir */
     pid_t pid = fork();
     if (pid == -1) {
-        perror("fork");
+        int error = errno;
         close(a->pipe_salida[0]);
         close(a->pipe_salida[1]);
         close(entrada[0]);
         close(entrada[1]);
+        errno = error;
         return -1;
     }
     if (pid == 0) {
@@ -403,7 +415,18 @@ void ejecutar_plan(int k) {
 
     int corriendo = 0;
     int terminadas = 0;  /* completadas + fallidas + abortadas */
+    int avisado = 0;     /* para avisar una sola vez si el sistema no da más procesos */
     clock_gettime(CLOCK_MONOTONIC, &inicio_simulacion);
+
+    /* SIGINT y SIGCHLD quedan bloqueadas mientras el padre trabaja y solo se
+       desbloquean dentro de sigsuspend. Así, si llegan en cualquier otro momento,
+       quedan pendientes y sigsuspend retorna de inmediato: no hay ventana entre
+       revisar g_seremi y dormirse en la que un Ctrl+C se pierda. */
+    sigset_t bloqueadas, mascara_espera;
+    sigemptyset(&bloqueadas);
+    sigaddset(&bloqueadas, SIGINT);
+    sigaddset(&bloqueadas, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &bloqueadas, &mascara_espera);
 
     while (terminadas < num_actividades) {
         /* Fiscalización de la Seremi */
@@ -418,27 +441,44 @@ void ejecutar_plan(int k) {
                     a->estado_final = ABORTADA;
                 }
             }
-            while (waitpid(-1, NULL, 0) > 0 || errno == EINTR) {}
+            while (waitpid(-1, NULL, 0) > 0) {}
             printf("[%6ld ms] [SEREMI] Clausura completada.\n", tiempo_actual());
             break;
         }
 
         /* Lanzar hasta completar límite K */
         while (inicio < fin && corriendo < k) {
-            if (lanzar_actividad(cola[inicio]) != 0) break;
+            if (lanzar_actividad(cola[inicio]) != 0) {
+                /* Si el sistema no permite más procesos o tuberías (K muy grande),
+                   la actividad queda en la cola y se reintenta cuando termine otra */
+                if (!avisado) {
+                    fprintf(stderr, "Aviso: el sistema no permite crear mas procesos (%s), "
+                                    "se esperara a que terminen actividades en curso\n", strerror(errno));
+                    avisado = 1;
+                }
+                break;
+            }
             inicio++;
             corriendo++;
         }
 
         if (corriendo == 0) {
-            if (inicio == fin && terminadas < num_actividades) {
+            if (inicio < fin) {
+                fprintf(stderr, "No se pudo crear ningun proceso, se detiene la simulacion\n");
+            } else {
                 fprintf(stderr, "No hay mas actividades listas para ejecutar\n");
             }
             break;
         }
 
+        /* Recoger un hijo terminado; si no hay ninguno, dormir hasta que llegue
+           SIGCHLD (terminó un hijo) o SIGINT (Ctrl+C). No hay busy-waiting. */
         int estado;
-        pid_t pid = waitpid(-1, &estado, 0);
+        pid_t pid;
+        while ((pid = waitpid(-1, &estado, WNOHANG)) == 0 && !g_seremi) {
+            sigsuspend(&mascara_espera);
+        }
+        if (pid == 0) continue;  /* llegó Ctrl+C: se atiende al inicio del ciclo */
         if (pid == -1) {
             if (errno == EINTR) continue;
             perror("waitpid");
@@ -480,6 +520,8 @@ void ejecutar_plan(int k) {
             abortar_rama(i, &terminadas);
         }
     }
+
+    sigprocmask(SIG_SETMASK, &mascara_espera, NULL);
 
     int cuenta[4] = {0, 0, 0, 0};
     for (int i = 0; i < num_actividades; i++) cuenta[actividades[i].estado_final]++;
@@ -529,6 +571,9 @@ int main(int argc, char *argv[]) {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
+
+    sa.sa_handler = manejador_sigchld;
+    sigaction(SIGCHLD, &sa, NULL);
 
     /* Si un hijo muere antes de leer sus insumos, write devuelve error en vez de matar al padre */
     sa.sa_handler = SIG_IGN;
