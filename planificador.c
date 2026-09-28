@@ -16,6 +16,13 @@
 #define MAX_NOMBRE 128
 #define TIEMPO_MIN 100
 #define TIEMPO_MAX 5000
+#define MAX_MENSAJE 128    /* tamaño fijo de cada mensaje que viaja por las tuberías */
+
+/* Estados de una actividad */
+#define PENDIENTE 0
+#define COMPLETADA 1
+#define FALLIDA 2
+#define ABORTADA 3
 
 typedef struct {
     char id[MAX_ID];
@@ -25,15 +32,19 @@ typedef struct {
     char **deps;       /* IDs de las dependencias, tal como vienen en el archivo */
     int *hijos;        /* posiciones de las actividades que dependen de esta */
     int num_hijos;
+    int *padres;       /* posiciones de las actividades de las que depende */
+    int num_padres;
     int pendientes;    /* dependencias que aún no terminan */
     pid_t pid;         /* pid del proceso que la simula (0 si no ha partido) */
-    int pipe_fd[2];    /* tubería para recibir el insumo de la actividad */
-    int estado_final;  /* 0 = pendiente, 1 = completada, 2 = fallida, 3 = abortada */
+    int pipe_salida[2];           /* tubería hijo -> padre con el insumo que produce */
+    char mensaje[MAX_MENSAJE];    /* insumo producido, se reenvía a los dependientes */
+    int estado_final;             /* PENDIENTE, COMPLETADA, FALLIDA o ABORTADA */
 } Actividad;
 
 Actividad *actividades = NULL;
 int num_actividades = 0;
 int capacidad = 0;
+int prob_fallo = 0;  /* porcentaje de probabilidad de que una actividad falle */
 
 struct timespec inicio_simulacion;
 static volatile sig_atomic_t g_seremi = 0;
@@ -43,6 +54,7 @@ void manejador_sigint(int sig) {
     g_seremi = 1;
 }
 
+/* Quita espacios al inicio y al final. Modifica el string. */
 char *recortar(char *s) {
     while (isspace((unsigned char)*s)) s++;
     char *fin = s + strlen(s);
@@ -168,14 +180,15 @@ int leer_plan(const char *ruta) {
     return 0;
 }
 
-void agregar_hijo(Actividad *a, int hijo) {
-    a->hijos = realloc(a->hijos, (a->num_hijos + 1) * sizeof(int));
-    if (a->hijos == NULL) {
+/* Agrega valor al final de una lista dinámica de enteros. */
+void agregar_entero(int **lista, int *cantidad, int valor) {
+    *lista = realloc(*lista, (*cantidad + 1) * sizeof(int));
+    if (*lista == NULL) {
         perror("realloc");
         exit(1);
     }
-    a->hijos[a->num_hijos] = hijo;
-    a->num_hijos++;
+    (*lista)[*cantidad] = valor;
+    (*cantidad)++;
 }
 
 /* Convierte los IDs de las dependencias en aristas del grafo:
@@ -201,7 +214,8 @@ int armar_grafo(void) {
             }
             if (repetida) continue;
 
-            agregar_hijo(&actividades[d], i);
+            agregar_entero(&actividades[d].hijos, &actividades[d].num_hijos, i);
+            agregar_entero(&a->padres, &a->num_padres, d);
             a->pendientes++;
         }
     }
@@ -257,48 +271,99 @@ long tiempo_actual(void) {
          + (ahora.tv_nsec - inicio_simulacion.tv_nsec) / 1000000;
 }
 
-/* Código que ejecuta el proceso hijo: duerme el tiempo de la actividad y termina. */
-void simular_actividad(Actividad *a) {
-    /* Cerrar lectura en el hijo */
-    close(a->pipe_fd[0]);
-
+void dormir_ms(int ms) {
     struct timespec espera;
-    espera.tv_sec = a->tiempo / 1000;
-    espera.tv_nsec = (long)(a->tiempo % 1000) * 1000000;
-    while (nanosleep(&espera, &espera) == -1 && errno == EINTR) {}
+    espera.tv_sec = ms / 1000;
+    espera.tv_nsec = (long)(ms % 1000) * 1000000;
+    while (nanosleep(&espera, &espera) == -1 && errno == EINTR) {
+        /* si una señal interrumpe el sueño, se sigue durmiendo lo que falta */
+    }
+}
 
-    /* Escribir mensaje de insumo por la tuberia */
-    char mensaje[256];
-    snprintf(mensaje, sizeof(mensaje), "Insumo de '%s' listo", a->nombre);
-    write(a->pipe_fd[1], mensaje, strlen(mensaje) + 1);
-    close(a->pipe_fd[1]);
+/* Código que ejecuta el proceso hijo de la actividad i.
+   Lee los insumos de sus dependencias desde "entrada", simula el trabajo
+   y envía su propio insumo al padre por pipe_salida. */
+void simular_actividad(int i, int entrada) {
+    Actividad *a = &actividades[i];
 
+    /* El hijo hereda las tuberías de las otras actividades en curso; no las usa */
+    for (int j = 0; j < num_actividades; j++) {
+        if (j != i && actividades[j].pid > 0 && actividades[j].estado_final == PENDIENTE) {
+            close(actividades[j].pipe_salida[0]);
+        }
+    }
+    close(a->pipe_salida[0]);
+
+    char mensaje[MAX_MENSAJE];
+    while (read(entrada, mensaje, MAX_MENSAJE) == MAX_MENSAJE) {
+        mensaje[MAX_MENSAJE - 1] = '\0';
+        printf("[%6ld ms] %s recibe: \"%s\"\n", tiempo_actual(), a->id, mensaje);
+    }
+    close(entrada);
+    fflush(stdout);
+
+    /* Cada hijo usa su propia semilla para decidir si falla */
+    srand(time(NULL) ^ getpid());
+    if (rand() % 100 < prob_fallo) {
+        dormir_ms(a->tiempo / 2);  /* falla a mitad de camino, sin entregar su insumo */
+        _exit(1);
+    }
+
+    dormir_ms(a->tiempo);
+
+    memset(mensaje, 0, sizeof(mensaje));
+    snprintf(mensaje, sizeof(mensaje), "insumo de %.100s listo", a->nombre);
+    if (write(a->pipe_salida[1], mensaje, MAX_MENSAJE) != MAX_MENSAJE) _exit(1);
+    close(a->pipe_salida[1]);
     _exit(0);
 }
 
-/* Crea el proceso de la actividad i. Devuelve 0 si se pudo, -1 si fork falló. */
+/* Crea el proceso de la actividad i y le envía los insumos de sus dependencias.
+   Devuelve 0 si se pudo, -1 si falló pipe o fork. */
 int lanzar_actividad(int i) {
     Actividad *a = &actividades[i];
-    if (pipe(a->pipe_fd) == -1) {
+    int entrada[2];  /* tubería padre -> hijo con los insumos de las dependencias */
+
+    if (pipe(a->pipe_salida) == -1) {
         perror("pipe");
         return -1;
     }
+    if (pipe(entrada) == -1) {
+        perror("pipe");
+        close(a->pipe_salida[0]);
+        close(a->pipe_salida[1]);
+        return -1;
+    }
 
-    fflush(stdout);
+    fflush(stdout);  /* para que el hijo no herede texto sin imprimir */
     pid_t pid = fork();
     if (pid == -1) {
         perror("fork");
-        close(a->pipe_fd[0]);
-        close(a->pipe_fd[1]);
+        close(a->pipe_salida[0]);
+        close(a->pipe_salida[1]);
+        close(entrada[0]);
+        close(entrada[1]);
         return -1;
     }
     if (pid == 0) {
-        simular_actividad(a);
+        close(entrada[1]);
+        simular_actividad(i, entrada[0]);
     }
-    close(a->pipe_fd[1]);
+
+    close(entrada[0]);
+    close(a->pipe_salida[1]);
     a->pid = pid;
     printf("[%6ld ms] inicia  %s (%s, %d ms, pid %d)\n",
            tiempo_actual(), a->id, a->nombre, a->tiempo, (int)pid);
+    fflush(stdout);  /* así "inicia" aparece antes de lo que imprima el hijo */
+
+    /* Reenviar al hijo el insumo de cada dependencia. Se cierra antes de
+       volver para que ningún otro hijo herede este extremo de escritura. */
+    for (int j = 0; j < a->num_padres; j++) {
+        Actividad *p = &actividades[a->padres[j]];
+        if (write(entrada[1], p->mensaje, MAX_MENSAJE) != MAX_MENSAJE) break;
+    }
+    close(entrada[1]);
     return 0;
 }
 
@@ -309,16 +374,18 @@ int buscar_por_pid(pid_t pid) {
     return -1;
 }
 
-void abortar_rama(int i, int *terminadas_count) {
+/* Marca como abortadas todas las actividades que dependen (directa o
+   indirectamente) de la actividad i. */
+void abortar_rama(int i, int *terminadas) {
     Actividad *a = &actividades[i];
     for (int h = 0; h < a->num_hijos; h++) {
         int hijo = a->hijos[h];
-        if (actividades[hijo].estado_final == 0) {
-            actividades[hijo].estado_final = 3;
-            (*terminadas_count)++;
+        if (actividades[hijo].estado_final == PENDIENTE) {
+            actividades[hijo].estado_final = ABORTADA;
+            (*terminadas)++;
             printf("[%6ld ms] [ABORTADA] Actividad %s cancelada por dependencia insatisfecha\n",
                    tiempo_actual(), actividades[hijo].id);
-            abortar_rama(hijo, terminadas_count);
+            abortar_rama(hijo, terminadas);
         }
     }
 }
@@ -335,7 +402,7 @@ void ejecutar_plan(int k) {
     }
 
     int corriendo = 0;
-    int terminadas = 0;
+    int terminadas = 0;  /* completadas + fallidas + abortadas */
     clock_gettime(CLOCK_MONOTONIC, &inicio_simulacion);
 
     while (terminadas < num_actividades) {
@@ -344,11 +411,14 @@ void ejecutar_plan(int k) {
             printf("\n[%6ld ms] [SEREMI] ¡Fiscalizacion! Abortando actividades en ejecucion...\n",
                    tiempo_actual());
             for (int i = 0; i < num_actividades; i++) {
-                if (actividades[i].pid > 0 && actividades[i].estado_final == 0) {
-                    kill(actividades[i].pid, SIGTERM);
+                Actividad *a = &actividades[i];
+                if (a->pid > 0 && a->estado_final == PENDIENTE) {
+                    kill(a->pid, SIGTERM);
+                    close(a->pipe_salida[0]);
+                    a->estado_final = ABORTADA;
                 }
             }
-            while (waitpid(-1, NULL, 0) > 0) {}
+            while (waitpid(-1, NULL, 0) > 0 || errno == EINTR) {}
             printf("[%6ld ms] [SEREMI] Clausura completada.\n", tiempo_actual());
             break;
         }
@@ -381,35 +451,41 @@ void ejecutar_plan(int k) {
         terminadas++;
         Actividad *a = &actividades[i];
 
-        char buffer[128];
-        ssize_t bytes = read(a->pipe_fd[0], buffer, sizeof(buffer) - 1);
-        if (bytes > 0) {
-            buffer[bytes] = '\0';
-            printf("[%6ld ms] pipe recibido de %s: \"%s\"\n", tiempo_actual(), a->id, buffer);
+        /* La actividad cuenta como completada solo si terminó bien y entregó su insumo */
+        int ok = WIFEXITED(estado) && WEXITSTATUS(estado) == 0;
+        if (ok) {
+            ssize_t bytes;
+            do {
+                bytes = read(a->pipe_salida[0], a->mensaje, MAX_MENSAJE);
+            } while (bytes == -1 && errno == EINTR);
+            ok = bytes == MAX_MENSAJE;
+            a->mensaje[MAX_MENSAJE - 1] = '\0';
         }
-        close(a->pipe_fd[0]);
+        close(a->pipe_salida[0]);
 
-        if (WIFEXITED(estado) && WEXITSTATUS(estado) == 0) {
-            a->estado_final = 1;
-            printf("[%6ld ms] termina %s (%s)\n", tiempo_actual(), a->id, a->nombre);
+        if (ok) {
+            a->estado_final = COMPLETADA;
+            printf("[%6ld ms] termina %s (%s) -> \"%s\"\n", tiempo_actual(), a->id, a->nombre, a->mensaje);
 
             for (int h = 0; h < a->num_hijos; h++) {
                 int hijo = a->hijos[h];
-                if (actividades[hijo].estado_final == 0) {
+                if (actividades[hijo].estado_final == PENDIENTE) {
                     actividades[hijo].pendientes--;
                     if (actividades[hijo].pendientes == 0) cola[fin++] = hijo;
                 }
             }
         } else {
-            a->estado_final = 2;
-            fprintf(stderr, "[%6ld ms] [FALLO] Actividad %s finalizo de forma anormal\n",
-                    tiempo_actual(), a->id);
+            a->estado_final = FALLIDA;
+            printf("[%6ld ms] [FALLO] Actividad %s finalizo de forma anormal\n", tiempo_actual(), a->id);
             abortar_rama(i, &terminadas);
         }
     }
 
-    printf("Simulacion terminada: %d de %d actividades completadas en %ld ms\n",
-           terminadas, num_actividades, tiempo_actual());
+    int cuenta[4] = {0, 0, 0, 0};
+    for (int i = 0; i < num_actividades; i++) cuenta[actividades[i].estado_final]++;
+    printf("Simulacion terminada en %ld ms: %d completadas, %d fallidas, %d abortadas, %d sin ejecutar (total %d)\n",
+           tiempo_actual(), cuenta[COMPLETADA], cuenta[FALLIDA], cuenta[ABORTADA], cuenta[PENDIENTE],
+           num_actividades);
     free(cola);
 }
 
@@ -418,13 +494,14 @@ void liberar_plan(void) {
         for (int j = 0; j < actividades[i].num_deps; j++) free(actividades[i].deps[j]);
         free(actividades[i].deps);
         free(actividades[i].hijos);
+        free(actividades[i].padres);
     }
     free(actividades);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Uso: %s plan.txt K\n", argv[0]);
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "Uso: %s plan.txt K [prob_fallo]\n", argv[0]);
         return 1;
     }
 
@@ -433,6 +510,15 @@ int main(int argc, char *argv[]) {
     if (*fin != '\0' || k <= 0) {
         fprintf(stderr, "K debe ser un entero mayor que 0\n");
         return 1;
+    }
+
+    if (argc == 4) {
+        long p = strtol(argv[3], &fin, 10);
+        if (*fin != '\0' || p < 0 || p > 100) {
+            fprintf(stderr, "prob_fallo debe ser un entero entre 0 y 100\n");
+            return 1;
+        }
+        prob_fallo = (int)p;
     }
 
     srand(time(NULL) ^ getpid());
@@ -444,12 +530,17 @@ int main(int argc, char *argv[]) {
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
 
+    /* Si un hijo muere antes de leer sus insumos, write devuelve error en vez de matar al padre */
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL);
+
     if (leer_plan(argv[1]) != 0 || armar_grafo() != 0 || revisar_ciclos() != 0) {
         liberar_plan();
         return 1;
     }
 
-    printf("Plan cargado: %d actividades, K = %ld\n", num_actividades, k);
+    printf("Plan cargado: %d actividades, K = %ld, probabilidad de fallo = %d%%\n",
+           num_actividades, k, prob_fallo);
     ejecutar_plan((int)k);
     liberar_plan();
     return 0;
