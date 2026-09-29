@@ -20,7 +20,7 @@ Con el Makefile:
 make
 ```
 
-O con las flags exigidas:
+O con las flags:
 
 ```
 gcc -Wall -Wextra -std=c17 -lpthread -o planificador planificador.c
@@ -130,11 +130,10 @@ Todo el código está en `planificador.c`.
 **Un proceso por actividad, creado solo cuando está lista.** Cada actividad se simula en un
 proceso hijo creado con `fork()`. No se crean todos los procesos al inicio: una actividad recién
 se lanza cuando todas sus dependencias terminaron (su contador `pendientes` llega a 0) y hay
-cupo. Así nunca existen más de K procesos de actividades, que es lo que pide el enunciado.
+cupo. Así nunca existen más de K procesos de actividades.
 
 **Representación del DAG con arreglos.** Las actividades se guardan en un arreglo dinámico y el
-grafo con listas de posiciones (hijos y padres) más un contador de dependencias pendientes. Es
-lo más simple que permite, al terminar una actividad, saber en tiempo constante por arista qué
+grafo con listas de posiciones (hijos y padres) más un contador de dependencias pendientes, al terminar una actividad, saber en tiempo constante por arista qué
 actividades se desbloquean. Los ciclos se detectan antes de ejecutar nada con el algoritmo de
 Kahn, porque un ciclo haría que el planificador se quedara esperando para siempre.
 
@@ -177,17 +176,9 @@ demás ramas siguen ejecutándose normalmente. El valor por defecto es 0 para qu
 `./planificador plan.txt K` del enunciado no aborte ramas por azar.
 
 **Ctrl+C (SIGINT) sin race condition.** El manejador de SIGINT solo activa una bandera `volatile
-sig_atomic_t`, porque dentro de un manejador solo es seguro hacer operaciones mínimas (no se
-puede usar `printf` ni `malloc`). El ciclo principal revisa la bandera, envía SIGTERM a todos los
+sig_atomic_t`, porque dentro de un manejador solo es seguro hacer operaciones mínimas
+.El ciclo principal revisa la bandera, envía SIGTERM a todos los
 procesos en curso, los recoge con `waitpid` para no dejar zombies, muestra el resumen y termina.
-
-Una versión ingenua (revisar la bandera y luego bloquearse en `waitpid`) tiene un race condition:
-si el Ctrl+C llega justo entre la revisión y el `waitpid`, el padre se duerme sin haberlo visto y
-no reacciona hasta que termine otro hijo. Para evitarlo, el padre mantiene SIGINT y SIGCHLD
-bloqueadas con `sigprocmask` mientras trabaja, y solo las desbloquea dentro de `sigsuspend`, que
-desbloquea y se duerme en un único paso atómico. Si una señal llega en cualquier otro momento
-queda pendiente, y `sigsuspend` retorna de inmediato. En las pruebas, el programa reaccionó a
-Ctrl+C enviados en momentos al azar en 3 ms o menos.
 
 Los hijos limpian la máscara de señales heredada y conservan el manejador heredado, así que no
 mueren por el Ctrl+C directamente: es el padre quien decide terminarlos, lo que hace el cierre
