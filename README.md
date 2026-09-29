@@ -20,14 +20,11 @@ Con el Makefile:
 make
 ```
 
-O directamente con las flags exigidas:
+O con las flags exigidas:
 
 ```
 gcc -Wall -Wextra -std=c17 -lpthread -o planificador planificador.c
 ```
-
-El programa no usa hilos; `-lpthread` solo se incluye porque lo pide la rúbrica. Compila sin
-warnings en Linux (gcc) y macOS.
 
 ## Ejecución
 
@@ -37,7 +34,7 @@ warnings en Linux (gcc) y macOS.
 
 - `plan.txt`: archivo con el plan de actividades.
 - `K`: máximo de procesos de actividades que pueden existir al mismo tiempo (entero mayor que 0).
-- `prob_fallo` (opcional): porcentaje de 0 a 100 de probabilidad de que cada actividad falle
+- `prob_fallo`: porcentaje de 0 a 100 de probabilidad de que cada actividad falle
   internamente. Si no se indica, vale 0, es decir, ninguna actividad falla por sí sola.
 
 Ejemplos:
