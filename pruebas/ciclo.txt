@@ -1,0 +1,5 @@
+# Debe rechazarse: 1 -> 2 -> 3 -> 1 forman un ciclo
+1 : a : 100 : 3
+2 : b : 100 : 1
+3 : c : 100 : 2
+4 : d : 100 :

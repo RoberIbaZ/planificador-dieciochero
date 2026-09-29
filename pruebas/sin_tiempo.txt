@@ -1,0 +1,4 @@
+# Las actividades sin tiempo reciben uno al azar entre 100 y 5000 ms
+A : sacar_la_guitarra : :
+B : afinar : : A
+C : cantar_cueca : 400 : [A, B]

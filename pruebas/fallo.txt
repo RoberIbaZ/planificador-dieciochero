@@ -1,0 +1,9 @@
+# Plan para probar el aislamiento de errores: si 2 falla, se aborta 4, 5 y 6,
+# pero 1, 3 y 7 siguen. Ejecutar con: ./planificador pruebas/fallo.txt 3 50
+1 : prender_carbon : 500 :
+2 : comprar_carne : 3000 :
+3 : comprar_pan : 300 :
+4 : asar_longaniza : 800 : 1, 2
+5 : armar_choripan : 250 : 3, 4
+6 : servir_mesa : 100 : 5
+7 : poner_cueca : 1500 : 3
